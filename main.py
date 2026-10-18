@@ -1,142 +1,86 @@
 import asyncio
-from asyncio import create_task
-from datetime import datetime
-from enum import Enum
+import random
+from typing import Any
 
-from colorama import init, Fore
-from ollama import Message
+from ollama import AsyncClient
+from telethon import TelegramClient, events
 
-from audio import audio_run
-from config import MY_TIME_ZONE, AUTHOR, LLM_MODEL, client, LOGO
-from data.database import Database
-from data.entities import MessageEntity, ChatEventEntity
-from mappers import message_entity_to_ollama_message, memory_entities_to_json_memory
-from memory_llm import memory_llm
-from telegram.main import get_me, send_message, get_dialogs, DialogInfo
-from voice import voice_init
-
-init(autoreset=True)
+from config import prompt, users, bot_name, tg_api_key, tg_api_hash, llm_api_key, smiles
+from get_tools import get_tools
+from is_chat_bot import is_chat_bot
+from tools.get_dialog import get_dialogs
+from tools.get_messages_chat_by_id import get_messages_chat_by_id
+from tools.send_message_by_chat_id import send_message_by_chat_id
 
 
-class WorkMode(Enum):
-    TEXT = 1
-    VOICE = 2
+class MemoryCache:
+    def __init__(self):
+        self._messages: list[Any] = []
+        self._spam_users: list[int] = []
 
+    def new_message(self, message):
+        self._messages.append(message)
 
-with open('resources/main_llm_prompt.txt', 'r') as file:
-    prompt = file.read()
+    def get_messages(self) -> list[Any]:
+        return self._messages
 
+    def add_spam_user(self, user):
+        self._spam_users.append(user)
 
-def datetime_converter(value: int) -> str:
-    return '0' + str(value) if (value < 10) else str(value)
-
+    def get_spam_users(self) -> list[int]:
+        return self._spam_users
 
 def startup():
-    now = datetime.now(MY_TIME_ZONE)
-    print(Fore.MAGENTA + LOGO)
-    print(f'''
-{Fore.BLUE + 'Author'}: {Fore.RESET + AUTHOR} 
-{Fore.BLUE + 'Started'}: {Fore.RESET + datetime_converter(now.hour)}:{datetime_converter(now.minute)} {datetime_converter(now.day)}.{datetime_converter(now.month)}.{datetime_converter(now.year)}
-    ''')
+    print('Hello, my name is Меридиана')
 
 
 async def main():
     startup()
-    database = Database()
-    message_entity = MessageEntity()
-    chat_event_entity = ChatEventEntity()
+    async with TelegramClient(session='client', api_id=tg_api_key, api_hash=tg_api_hash) as tg_client, \
+            AsyncClient(host="https://ollama.com", headers={"Authorization": "Bearer " + llm_api_key}) as llm_client:
+        cache = MemoryCache()
+        messages = list()
 
-    await database.init_db()
+        @tg_client.on(events.NewMessage(func=lambda e: e.is_private))
+        async def antispam(event):
+            if event.message.sender_id in cache.get_spam_users():
+                await event.reply('Вы в бане за спам.')
+                await event.message.delete()
 
-    work_mode = int(input('''
-Work mode:
-1. Text
-2. Voice
+            users_ids = [int(msg.sender_id) for msg in messages]
+            if event.message.sender_id in users_ids:
+                if event.message.text == messages[users_ids.index(event.message.sender_id)].text:
+                    messages.append(event.message)
+                else:
+                    messages[users_ids.index(event.message.sender_id)] = event.message
+            else:
+                messages.append(event.message)
+            if users_ids.count(event.message.sender_id) > 5:
+                cache.add_spam_user(event.message.sender_id)
 
-Input: '''))
+        @tg_client.on(events.NewMessage(from_users=users))
+        async def chat(event):
+            chat_messages = await tg_client.get_messages(event.chat_id, limit=20)
 
-    messages = []
-    while True:
-        message: str
-        match work_mode:
-            case WorkMode.TEXT.value:
-                message = input('Input: ')
-            case WorkMode.VOICE.value:
-                message = voice_init()
-            case _:
-                message = input('Input: ')
-        await message_entity.new_message('user', message)
+            new_message: str = event.message.text
+            cache.new_message({'role': 'user', 'content': new_message})
 
-        messages_entity = await message_entity.get_latest_messages()
-        messages_result = message_entity_to_ollama_message(messages_entity)
+            if await is_chat_bot(event=event, new_message=new_message):
+                response = await llm_client.chat(
+                    model='gemma4:cloud',
+                    messages=[
+                        {'role': 'system', 'content': prompt + f'\nАктуальные сообщения данного чата: {chat_messages}'},
+                        *cache.get_messages()],
+                    tools=[get_dialogs, send_message_by_chat_id, get_messages_chat_by_id],
+                    stream=False)
+                if response.message.content:
+                    await event.reply(
+                        f'`{random.choice(smiles)} {bot_name}`\n' + response.message.content)
+                cache.new_message(response.message)
+                await get_tools(event, response, tg_client, llm_client, cache)
 
-        asyncio.create_task(memory_llm(messages_result))
+        await tg_client.disconnected
 
-        print('Output: ')
-        output_ai = list()
 
-        memory_entity = await chat_event_entity.get_latest_memory()
-        memory_json = memory_entities_to_json_memory(reversed(memory_entity))
-
-        messages.append(
-            Message(
-                role="system",
-                content=f"""
-    ## PROMPT
-    {prompt}
-    
-    ## MEMORY
-    {memory_json}
-    
-    ## INFO
-    time: {datetime.now(MY_TIME_ZONE)}
-    
-    ## TELEGRAM INFO
-    {await get_me()}
-    
-    """
-            )
-        )
-
-        for message in reversed(messages_result):
-            messages.append(message)
-
-        while True:
-            response = client.chat(LLM_MODEL, messages=messages, think=False, stream=True, tools=[get_dialogs, send_message])
-            tool_called = False
-            for chunk in response:
-                content = chunk['message']['content']
-                print(Fore.MAGENTA + content + Fore.RESET, end='', flush=True)
-                output_ai.append(content)
-
-                if chunk.message.tool_calls:
-                    tool_called = True
-
-                    messages.append(chunk.message)
-                    for tool in chunk.message.tool_calls:
-                        if tool.function.name == 'send_message':
-                            args = tool.function.arguments
-                            await send_message(**args)
-                        if tool.function.name == 'get_dialogs':
-                            dialogs: list[DialogInfo] = await get_dialogs()
-                            messages.append(
-                                Message(
-                                    role="assistant",
-                                    content=f'{dialogs}'
-                                )
-                            )
-
-            message = ''.join(output_ai)
-            if message != '':
-                audio_run(message)
-            create_task(message_entity.new_message('assistant', message))
-            print()
-
-            if not tool_called:
-                break
-
-# try:
-if __name__ == "__main__":
+if __name__ == '__main__':
     asyncio.run(main())
-# except Exception as _:
-#     pass
