@@ -19,14 +19,14 @@ async def get_tools(event, response, tg_client, llm_client, cache):
                     await send_message_by_chat_id(tg_client, **args)
                 elif call.function.name == 'get_messages_chat_by_id':
                     result = await get_messages_chat_by_id(tg_client, **args)
-                cache.new_message({'role': 'tool', 'tool_name': call.function.name, 'content': str(result)})
+                await cache.new_message({'role': 'tool', 'tool_name': call.function.name, 'content': str(result)})
             response = await llm_client.chat(
                 model='gemma4:cloud',
-                messages=[{'role': 'system', 'content': prompt}, *cache.get_messages()],
+                messages=[{'role': 'system', 'content': prompt}, *(await cache.get_messages())],
                 tools=[get_dialogs, send_message_by_chat_id, get_messages_chat_by_id],
                 think=False,
                 stream=False)
-            cache.new_message(response.message)
+            await cache.new_message(response.message)
             if response.message.content:
                 await event.reply(meridian_intro + response.message.content)
         else:

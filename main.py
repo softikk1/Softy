@@ -5,7 +5,7 @@ from ollama import AsyncClient
 from telethon import TelegramClient, events
 
 from config import prompt, users, tg_api_key, tg_api_hash, llm_api_key, meridian_intro, prefix
-from database import init_db, is_spam_user, add_spam_user, get_spammers_list_id, delete_spammer as delete_spammer_db
+from database import init_db, is_spam_user, get_spammers_list_id, delete_spammer as delete_spammer_db, add_spam_user
 from get_tools import get_tools
 from is_chat_bot import is_chat_bot
 from tools.get_dialog import get_dialogs
@@ -18,17 +18,22 @@ class MemoryCache:
         self._messages: list[Any] = []
         self._spam_messages: list[Any] = []
 
-    def new_message(self, message):
+    async def new_message(self, message):
+        if len(self._messages) > 20:
+            self._messages.remove(self._messages[0])
         self._messages.append(message)
 
-    def get_messages(self) -> list[Any]:
+    async def get_messages(self) -> list[Any]:
         return self._messages
 
-    def add_spam_messages(self, message):
+    async def add_spam_messages(self, message):
         self._spam_messages.append(message)
 
-    def get_spam_messages(self) -> list[Any]:
+    async def get_spam_messages(self) -> list[Any]:
         return self._spam_messages
+
+    async def clear_spam_messages(self, user_id):
+        self._spam_messages = [message for message in self._spam_messages if message.sender_id != user_id]
 
 
 def startup():
@@ -47,17 +52,21 @@ async def main():
             if await is_spam_user(event.message.sender_id):
                 await event.reply('Вы в бане за спам.')
                 await event.message.delete()
-
-            users_ids = [int(msg.sender_id) for msg in cache.get_spam_messages()]
-            if event.message.sender_id in users_ids:
-                if event.message.text == cache.get_spam_messages()[users_ids.index(event.message.sender_id)].text:
-                    cache.add_spam_messages(event.message)
+                return
+            await cache.add_spam_messages(event.message)
+            messages = await cache.get_spam_messages()
+            max_streak = 1
+            last_text = ''
+            for text in [msg.text for msg in messages]:
+                if last_text == text:
+                    max_streak += 1
                 else:
-                    cache.get_spam_messages()[users_ids.index(event.message.sender_id)] = event.message
-            else:
-                cache.add_spam_messages(event.message)
-            if users_ids.count(event.message.sender_id) > 5 and not await is_spam_user(event.message.sender_id):
+                    max_streak = 1
+                last_text = text
+
+            if max_streak >= 5 and not await is_spam_user(event.message.sender_id):
                 await add_spam_user(event.message.sender_id)
+                await cache.clear_spam_messages(event.message.sender_id)
 
         @tg_client.on(events.NewMessage(pattern=f'{prefix}get_spammers', from_users=users))
         async def get_spammers(event):
@@ -72,25 +81,57 @@ async def main():
 
         @tg_client.on(events.NewMessage(from_users=users))
         async def chat(event):
-            chat_messages = await tg_client.get_messages(event.chat_id, limit=20)
+            try:
+                chat_messages = [f'{getattr(await msg.get_sender(), 'username')} ({msg.sender_id}): {msg.text}' for msg
+                                 in await tg_client.get_messages(event.chat_id, limit=20)]
 
-            new_message: str = event.message.text
-            cache.new_message({'role': 'user', 'content': new_message})
+                new_message: str = event.message.text
+                await cache.new_message({'role': 'user', 'content': new_message})
 
-            if await is_chat_bot(event=event, new_message=new_message):
-                response = await llm_client.chat(
-                    model='gemma4:cloud',
-                    messages=[
-                        {'role': 'system', 'content': prompt + f'\nАктуальные сообщения данного чата: {chat_messages}'},
-                        *cache.get_messages()],
-                    tools=[get_dialogs, send_message_by_chat_id, get_messages_chat_by_id],
-                    think=False,
-                    stream=False)
-                if response.message.content:
-                    await event.reply(
-                        meridian_intro + response.message.content)
-                cache.new_message(response.message)
-                await get_tools(event, response, tg_client, llm_client, cache)
+                reply_message_text = ''
+                reply_message = await event.get_reply_message()
+                if reply_message:
+                    reply_message_text = reply_message.raw_text
+
+                if await is_chat_bot(event=event, new_message=new_message):
+                    response = await llm_client.chat(
+                        model='gemma4:cloud',
+                        messages=[
+                            {'role': 'system',
+                             'content': prompt + f'''
+
+=== КОНТЕКСТ ЧАТА (самое важное) ===
+{chat_messages}
+
+Сообщения, начинающиеся с "{meridian_intro}" — это твои предыдущие ответы. Используй их как образец стиля.
+
+''' + (f'''
+=== СООБЩЕНИЕ, НА КОТОРОЕ СЕЙЧАС ИДЁТ REPLY ===
+{reply_message_text}
+''' if reply_message_text else '') + '''
+
+=== ЖЁСТКИЕ ПРАВИЛА ===
+1. Ты — Меридиана. Отвечай коротко, живо, с характером.
+2. Если пользователь пишет "ответь", "напиши", "скажи", "отправь" и т.п. — это КОМАНДА, а не вопрос.
+   - Не переспрашивай "а что именно ответить?".
+   - Возьми контекст из истории выше.
+   - Сразу придумай короткий естественный ответ и вызови tool send_message_by_chat_id.
+3. Не задавай уточняющих вопросов, если в контексте уже есть достаточно информации.
+4. Приоритет №1 — контекст чата. Не выдумывай то, чего там нет.
+5. Если нужно больше истории — используй get_messages_chat_by_id. Не проси пользователя объяснить то, что уже написано.
+'''
+                             },
+                            *(await cache.get_messages())],
+                        tools=[get_dialogs, send_message_by_chat_id, get_messages_chat_by_id],
+                        think=False,
+                        stream=False)
+                    if response.message.content:
+                        await event.reply(
+                            meridian_intro + response.message.content)
+                    await cache.new_message(response.message)
+                    await get_tools(event, response, tg_client, llm_client, cache)
+            except Exception as e:
+                await event.reply(f'Ошибка: {e}')
 
         await tg_client.disconnected
 

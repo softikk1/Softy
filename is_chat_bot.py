@@ -26,4 +26,4 @@ async def is_chat_bot(event, new_message) -> bool:
     #     )
     #     is_meridian = 'да' in response_is_meridian.message.content.lower()
     # return bot_name in reply_message_text or is_meridian
-    return bot_name in reply_message_text or 'ми' in new_message.lower()
+    return bot_name in reply_message_text or 'мирида' in new_message.lower()
