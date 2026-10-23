@@ -21,28 +21,28 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
 
 
-async def add_spam_user(user_id: int, level: int = 1):
+async def add_or_refresh_spam_user(user_id: int, level: int = 1):
     async with Session() as s:
-        s.add(Spammers(user_id=user_id, spam_level=level))
-        await s.commit()
+        user = await s.get(Spammers, user_id)
+        if user is None:
+            s.add(Spammers(user_id=user_id, spam_level=level))
+            await s.commit()
+            return
+        else:
+            user.spam_level += 1
+            await s.commit()
+            return
 
 
-async def replace_spam_user(user_id: int, level: int):
+async def get_spam_level_user(user_id: int) -> int:
     async with Session() as s:
         user = await s.scalar(select(Spammers).where(Spammers.user_id == user_id))
-        user.spam_level = level
-        await s.commit()
+        return user.spam_level
 
 
-async def is_spam_user(user_id: int) -> bool:
+async def get_spammers_list_id() -> list[Spammers]:
     async with Session() as s:
-        user = await s.scalar(select(Spammers).where(Spammers.user_id == user_id))
-        return user is not None
-
-
-async def get_spammers_list_id() -> list[int]:
-    async with Session() as s:
-        result = await s.scalars(select(Spammers.user_id))
+        result = await s.scalars(select(Spammers))
         return result.all()
 
 
